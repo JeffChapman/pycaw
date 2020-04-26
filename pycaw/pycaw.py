@@ -2,7 +2,7 @@
 Python wrapper around the Core Audio Windows API.
 """
 from ctypes import (HRESULT, POINTER, Structure, Union, c_float, c_longlong,
-                    c_uint32)
+                    c_uint32, cast)
 from ctypes.wintypes import (BOOL, DWORD, INT, LONG, LPCWSTR, LPWSTR, UINT,
                              ULARGE_INTEGER, VARIANT_BOOL, WORD)
 from enum import Enum
@@ -55,7 +55,7 @@ class PROPVARIANT(Structure):
         elif vt == VT_CLSID:
             # TODO
             # return (Guid)Marshal.PtrToStructure(union.puuid, typeof(Guid))
-            return
+            return self.union
         else:
             return "%s:?" % (vt)
 
@@ -533,19 +533,57 @@ class AudioDevice(object):
     """
     http://stackoverflow.com/a/20982715/185510
     """
-    def __init__(self, id, state, properties):
-        self.id = id
+    dev_pointer = None
+    session_manager = None
+    audio_sessions = None
+
+    def __init__(self, device, idx, state, properties):
+        self.device = device
+        self.id = idx
         self.state = state
         self.properties = properties
 
     def __str__(self):
         return "AudioDevice: %s" % (self.FriendlyName)
 
+    def activate_endpoint(self):
+        activated_dev = self.device.Activate(
+           IAudioEndpointVolume._iid_, comtypes.CLSCTX_ALL, None
+        )
+        self.dev_pointer = cast(activated_dev, POINTER(IAudioEndpointVolume))
+
+    def activate_session_manager(self):
+        activated_dev = self.device.Activate(
+            IAudioSessionManager2._iid_, comtypes.CLSCTX_ALL, None)
+        self.session_manager = activated_dev.QueryInterface(IAudioSessionManager2)
+
+    def populate_session_list(self):
+        audio_sessions = []
+        if self.session_manager is not None:
+            session_enumerator = self.session_manager.GetSessionEnumerator()
+            count = session_enumerator.GetCount()
+            for i in range(count):
+                ctl = session_enumerator.GetSession(i)
+                if ctl is None:
+                    continue
+                ctl2 = ctl.QueryInterface(IAudioSessionControl2)
+                if ctl2 is not None:
+                    audio_session = AudioSession(ctl2)
+                    audio_sessions.append(audio_session)
+            self.audio_sessions = audio_sessions
+
     @property
     def FriendlyName(self):
         DEVPKEY_Device_FriendlyName = \
             u"{a45c254e-df1c-4efd-8020-67d146a850e0} 14".upper()
         value = self.properties.get(DEVPKEY_Device_FriendlyName)
+        return value
+
+    @property
+    def ShortName(self):
+        DEVPKEY_Device_ShortName = \
+            u"{a45c254e-df1c-4efd-8020-67d146a850e0} 2".upper()
+        value = self.properties.get(DEVPKEY_Device_ShortName)
         return value
 
 
@@ -701,14 +739,18 @@ class AudioUtilities(object):
             propCount = store.GetCount()
             for j in range(propCount):
                 pk = store.GetAt(j)
-                value = store.GetValue(pk)
+                try:
+                    value = store.GetValue(pk)
+                except comtypes.COMError:
+                    # print(f'Error getting value for: [{id}]{pk}')
+                    continue
                 v = value.GetValue()
                 # TODO
                 # PropVariantClear(byref(value))
                 name = str(pk)
                 properties[name] = v
         audioState = AudioDeviceState(state)
-        return AudioDevice(id, audioState, properties)
+        return AudioDevice(dev, id, audioState, properties)
 
     @staticmethod
     def GetAllDevices():
@@ -730,4 +772,13 @@ class AudioUtilities(object):
             dev = collection.Item(i)
             if dev is not None:
                 devices.append(AudioUtilities.CreateDevice(dev))
+        return devices
+
+    @staticmethod
+    def GetAllActiveDevices():
+        devices = []
+        all_devices = AudioUtilities.GetAllDevices()
+        for device in all_devices:
+            if AudioDeviceState.Active == device.state:
+                devices.append(device)
         return devices
